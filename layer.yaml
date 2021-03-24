@@ -29,6 +29,7 @@ options:
       - 'ceph-common'
       - 'nfs-common'
       - 'socat'
+      - 'open-iscsi'
   tls-client:
     ca_certificate_path: '/root/cdk/ca.crt'
   cdk-service-kicker:
