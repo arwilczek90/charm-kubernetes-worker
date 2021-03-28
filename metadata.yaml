@@ -52,7 +52,7 @@ provides:
     interface: http
 storage:
   "openebs":
-    "type": "filesystem"
+    "type": "block"
     "minimum-size": 204800M
     multiple:
       range: "0-1"
