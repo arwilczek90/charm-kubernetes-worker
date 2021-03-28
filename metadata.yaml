@@ -54,8 +54,6 @@ storage:
   "openebs":
     "type": "block"
     "minimum-size": 204800M
-    multiple:
-      range: "0-1"
 resources:
   cni-amd64:
     type: file
