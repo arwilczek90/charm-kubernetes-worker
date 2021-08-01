@@ -32,9 +32,10 @@ from charms import layer
 from charms.layer import snap
 from charms.reactive import hook
 from charms.reactive import endpoint_from_flag
+from charms.reactive import endpoint_from_name
 from charms.reactive import remove_state, clear_flag
 from charms.reactive import set_state, set_flag
-from charms.reactive import is_state, is_flag_set
+from charms.reactive import is_state, is_flag_set, any_flags_set
 from charms.reactive import when, when_any, when_not, when_none
 from charms.reactive import data_changed, is_data_changed
 from charms.templating.jinja2 import render
@@ -439,6 +440,16 @@ def charm_status():
     if is_state('kubernetes-worker.cohorts.failed'):
         hookenv.status_set('waiting',
                            'Failed to join snap cohorts (see logs), will retry.')
+    if missing_kube_control():
+        # the check calls status_set
+        return
+    if not any_flags_set('kube-control.api_endpoints.available',
+                         'kube-api-endpoint.available'):
+        hookenv.status_set('waiting', 'Waiting for cluster endpoint.')
+        return
+    if not get_kube_api_servers():
+        hookenv.status_set('waiting', 'Unable to determine cluster endpoint.')
+        return
     if not is_state('kube-control.auth.available'):
         hookenv.status_set('waiting', 'Waiting for cluster credentials.')
         return
@@ -578,17 +589,18 @@ def send_data():
                                          key_path=client_key_path)
 
 
-@when('kube-api-endpoint.available', 'kube-control.dns.available',
-      'cni.available', 'endpoint.container-runtime.available')
+@when('kube-control.dns.available', 'cni.available',
+      'endpoint.container-runtime.available')
+@when_any('kube-control.api_endpoints.available',
+          'kube-api-endpoint.available')
 def watch_for_changes():
     ''' Watch for configuration changes and signal if we need to restart the
     worker services '''
-    kube_api = endpoint_from_flag('kube-api-endpoint.available')
     kube_control = endpoint_from_flag('kube-control.dns.available')
     container_runtime = \
         endpoint_from_flag('endpoint.container-runtime.available')
 
-    servers = get_kube_api_servers(kube_api)
+    servers = get_kube_api_servers()
     dns = kube_control.get_dns()
     cluster_cidr = kubernetes_common.cluster_cidr()
     container_runtime_name = \
@@ -611,7 +623,7 @@ def watch_for_changes():
         set_state('kubernetes-worker.restart-needed')
 
 
-@when('kubernetes-worker.snaps.installed', 'kube-api-endpoint.available',
+@when('kubernetes-worker.snaps.installed',
       'tls_client.ca.saved', 'tls_client.certs.saved',
       'kube-control.dns.available', 'kube-control.auth.available',
       'cni.available', 'kubernetes-worker.restart-needed',
@@ -620,22 +632,27 @@ def watch_for_changes():
 @when_not('kubernetes-worker.cloud.pending',
           'kubernetes-worker.cloud.blocked',
           'upgrade.series.in-progress')
+@when_any('kube-control.api_endpoints.available',
+          'kube-api-endpoint.available')
 def start_worker():
     ''' Start kubelet using the provided API and DNS info.'''
     # Note that the DNS server doesn't necessarily exist at this point. We know
     # what its IP will eventually be, though, so we can go ahead and configure
     # kubelet with that info. This ensures that early pods are configured with
     # the correct DNS even though the server isn't ready yet.
-    kube_api = endpoint_from_flag('kube-api-endpoint.available')
     kube_control = endpoint_from_flag('kube-control.dns.available')
 
-    servers = get_kube_api_servers(kube_api)
+    servers = get_kube_api_servers()
     dns = kube_control.get_dns()
     ingress_ip = get_node_ip()
     cluster_cidr = kubernetes_common.cluster_cidr()
 
     if cluster_cidr is None:
         hookenv.log('Waiting for cluster cidr.')
+        return
+
+    if not servers:
+        hookenv.log("Waiting for API server URL")
         return
 
     if kubernetes_common.is_ipv6(cluster_cidr):
@@ -662,7 +679,7 @@ def start_worker():
 def configure_cni(cni):
     ''' Set worker configuration on the CNI relation. This lets the CNI
     subordinate know that we're the worker so it can respond accordingly. '''
-    cni.set_config(is_master=False, kubeconfig_path=kubeconfig_path)
+    cni.set_config(is_master=False)
 
 
 @when('config.changed.labels')
@@ -761,6 +778,9 @@ def create_config(server, creds):
                       token=creds['kubelet_token'], user='kubelet')
     create_kubeconfig(kubeproxyconfig_path, server, ca_crt_path,
                       token=creds['proxy_token'], user='kube-proxy')
+    cni = endpoint_from_name('cni')
+    if cni:
+        cni.notify_kubeconfig_changed()
 
 
 def merge_kubelet_extra_config(config, extra_config):
@@ -812,92 +832,68 @@ def configure_kubelet(dns, ingress_ip):
         kubelet_opts['cloud-config'] = str(kubelet_cloud_config_path)
         kubelet_opts['provider-id'] = azure.vm_id
 
-    if get_version('kubelet') >= (1, 10):
-        # Put together the KubeletConfiguration data
-        kubelet_config = {
-            'apiVersion': 'kubelet.config.k8s.io/v1beta1',
-            'kind': 'KubeletConfiguration',
-            'address': '0.0.0.0',
-            'authentication': {
-                'anonymous': {
-                    'enabled': False
-                },
-                'x509': {
-                    'clientCAFile': str(ca_crt_path)
-                }
+    # Put together the KubeletConfiguration data
+    kubelet_config = {
+        'apiVersion': 'kubelet.config.k8s.io/v1beta1',
+        'kind': 'KubeletConfiguration',
+        'address': '0.0.0.0',
+        'authentication': {
+            'anonymous': {
+                'enabled': False
             },
-            # NB: authz webhook config tells the kubelet to ask the api server
-            # if a request is authorized; it is not related to the authn
-            # webhook config of the k8s master services.
-            'authorization': {
-                'mode': 'Webhook'
-            },
-            'clusterDomain': dns['domain'],
-            'failSwapOn': False,
-            'port': 10250,
-            'protectKernelDefaults': True,
-            'readOnlyPort': 0,
-            'tlsCertFile': str(server_crt_path),
-            'tlsPrivateKeyFile': str(server_key_path)
-        }
-        if dns['enable-kube-dns']:
-            kubelet_config['clusterDNS'] = [dns['sdn-ip']]
+            'x509': {
+                'clientCAFile': str(ca_crt_path)
+            }
+        },
+        # NB: authz webhook config tells the kubelet to ask the api server
+        # if a request is authorized; it is not related to the authn
+        # webhook config of the k8s master services.
+        'authorization': {
+            'mode': 'Webhook'
+        },
+        'clusterDomain': dns['domain'],
+        'failSwapOn': False,
+        'port': 10250,
+        'protectKernelDefaults': True,
+        'readOnlyPort': 0,
+        'tlsCertFile': str(server_crt_path),
+        'tlsPrivateKeyFile': str(server_key_path)
+    }
+    if dns['enable-kube-dns']:
+        kubelet_config['clusterDNS'] = [dns['sdn-ip']]
 
-        # Handle feature gates
-        feature_gates = {}
-        if get_version('kubelet') >= (1, 19):
-            # NB: required for CIS compliance
-            feature_gates['RotateKubeletServerCertificate'] = True
-        if is_state('kubernetes-worker.gpu.enabled'):
-            feature_gates['DevicePlugins'] = True
-        if feature_gates:
-            kubelet_config['featureGates'] = feature_gates
-        if kubernetes_common.is_dual_stack(kubernetes_common.cluster_cidr()):
-            feature_gates = kubelet_config.setdefault('featureGates', {})
-            feature_gates['IPv6DualStack'] = True
+    # Handle feature gates
+    feature_gates = {}
+    if get_version('kubelet') >= (1, 19):
+        # NB: required for CIS compliance
+        feature_gates['RotateKubeletServerCertificate'] = True
+    if is_state('kubernetes-worker.gpu.enabled'):
+        feature_gates['DevicePlugins'] = True
+    if feature_gates:
+        kubelet_config['featureGates'] = feature_gates
+    if kubernetes_common.is_dual_stack(kubernetes_common.cluster_cidr()):
+        feature_gates = kubelet_config.setdefault('featureGates', {})
+        feature_gates['IPv6DualStack'] = True
 
-        # Workaround for DNS on bionic
-        # https://github.com/juju-solutions/bundle-canonical-kubernetes/issues/655
-        resolv_path = os.path.realpath('/etc/resolv.conf')
-        if resolv_path == '/run/systemd/resolve/stub-resolv.conf':
-            kubelet_config['resolvConf'] = '/run/systemd/resolve/resolv.conf'
+    # Workaround for DNS on bionic
+    # https://github.com/juju-solutions/bundle-canonical-kubernetes/issues/655
+    resolv_path = os.path.realpath('/etc/resolv.conf')
+    if resolv_path == '/run/systemd/resolve/stub-resolv.conf':
+        kubelet_config['resolvConf'] = '/run/systemd/resolve/resolv.conf'
 
-        # Add kubelet-extra-config. This needs to happen last so that it
-        # overrides any config provided by the charm.
-        kubelet_extra_config = hookenv.config('kubelet-extra-config')
-        kubelet_extra_config = yaml.safe_load(kubelet_extra_config)
-        merge_kubelet_extra_config(kubelet_config, kubelet_extra_config)
+    # Add kubelet-extra-config. This needs to happen last so that it
+    # overrides any config provided by the charm.
+    kubelet_extra_config = hookenv.config('kubelet-extra-config')
+    kubelet_extra_config = yaml.safe_load(kubelet_extra_config)
+    merge_kubelet_extra_config(kubelet_config, kubelet_extra_config)
 
-        # Render the file and configure Kubelet to use it
-        os.makedirs('/root/cdk/kubelet', exist_ok=True)
-        with open('/root/cdk/kubelet/config.yaml', 'w') as f:
-            f.write('# Generated by kubernetes-worker charm, do not edit\n')
-            yaml.dump(kubelet_config, f)
-        kubelet_opts['config'] = '/root/cdk/kubelet/config.yaml'
-    else:
-        # NOTE: This is for 1.9. Once we've dropped 1.9 support, we can remove
-        # this whole block and the parent if statement.
-        kubelet_opts['address'] = '0.0.0.0'
-        kubelet_opts['anonymous-auth'] = 'false'
-        kubelet_opts['client-ca-file'] = str(ca_crt_path)
-        kubelet_opts['cluster-domain'] = dns['domain']
-        kubelet_opts['fail-swap-on'] = 'false'
-        kubelet_opts['port'] = '10250'
-        kubelet_opts['tls-cert-file'] = str(server_crt_path)
-        kubelet_opts['tls-private-key-file'] = str(server_key_path)
-        if dns['enable-kube-dns']:
-            kubelet_opts['cluster-dns'] = dns['sdn-ip']
-        if is_state('kubernetes-worker.gpu.enabled'):
-            kubelet_opts['feature-gates'] = 'DevicePlugins=true'
-
-        # Workaround for DNS on bionic, for k8s 1.9
-        # https://github.com/juju-solutions/bundle-canonical-kubernetes/issues/655
-        resolv_path = os.path.realpath('/etc/resolv.conf')
-        if resolv_path == '/run/systemd/resolve/stub-resolv.conf':
-            kubelet_opts['resolv-conf'] = '/run/systemd/resolve/resolv.conf'
-
-    if get_version('kubelet') >= (1, 11):
-        kubelet_opts['dynamic-config-dir'] = '/root/cdk/kubelet/dynamic-config'
+    # Render the file and configure Kubelet to use it
+    os.makedirs('/root/cdk/kubelet', exist_ok=True)
+    with open('/root/cdk/kubelet/config.yaml', 'w') as f:
+        f.write('# Generated by kubernetes-worker charm, do not edit\n')
+        yaml.dump(kubelet_config, f)
+    kubelet_opts['config'] = '/root/cdk/kubelet/config.yaml'
+    kubelet_opts['dynamic-config-dir'] = '/root/cdk/kubelet/dynamic-config'
 
     # If present, ensure kubelet gets the pause container from the configured
     # registry. When not present, kubelet uses a default image location
@@ -999,7 +995,7 @@ def render_and_launch_ingress():
             context['ingress_uid'] = '101'
             context['ingress_image'] = '/'.join([
                 registry_location or 'us.gcr.io',
-                'k8s-artifacts-prod/ingress-nginx/controller:v0.44.0',
+                'k8s-artifacts-prod/ingress-nginx/controller:v0.45.0',
             ])
 
     kubelet_version = get_version('kubelet')
@@ -1073,25 +1069,32 @@ def restart_unit_services():
         service_restart('snap.%s.daemon' % service)
 
 
-def get_kube_api_servers(kube_api):
-    '''Return the kubernetes api server address and port for this
-    relationship.'''
-    hosts = []
-    # Iterate over every service from the relation object.
-    for service in kube_api.services():
-        for unit in service['hosts']:
-            hosts.append('https://{0}:{1}'.format(unit['hostname'],
-                                                  unit['port']))
-    return hosts
+def get_kube_api_servers():
+    '''Return the list of kubernetes API endpoint URLs.'''
+    kube_control = endpoint_from_name("kube-control")
+    kube_api = endpoint_from_name("kube-api-endpoint")
+    # prefer kube-api-endpoints
+    if kube_api.services():
+        return [
+            'https://{0}:{1}'.format(unit['hostname'], unit['port'])
+            for service in kube_api.services()
+            for unit in service['hosts']
+        ]
+    if hasattr(kube_control, "get_api_endpoints"):
+        return kube_control.get_api_endpoints()
+    hookenv.log("Unable to determine API server URLs from either kube-control "
+                "or kube-api-endpoint relation", hookenv.ERROR)
+    return []
 
 
 @when('kubernetes-worker.config.created')
 @when('nrpe-external-master.available')
-@when('kube-api-endpoint.available')
 @when('kube-control.auth.available')
 @when_any('config.changed.nagios_context',
           'config.changed.nagios_servicegroups',
           'nrpe-external-master.reconfigure')
+@when_any('kube-control.api_endpoints.available',
+          'kube-api-endpoint.available')
 def update_nrpe_config():
     services = ['snap.{}.daemon'.format(s) for s in worker_services]
     data = render('nagios_plugin.py', context={'node_name': get_node_name()})
@@ -1107,9 +1110,8 @@ def update_nrpe_config():
     nrpe_setup.write()
 
     creds = db.get('credentials')
-    if creds:
-        kube_api = endpoint_from_flag('kube-api-endpoint.available')
-        servers = get_kube_api_servers(kube_api)
+    servers = get_kube_api_servers()
+    if creds and servers:
         server = servers[get_unit_number() % len(servers)]
         create_kubeconfig(nrpe_kubeconfig_path, server, ca_crt_path,
                           token=creds['client_token'], user='nagios')
@@ -1146,13 +1148,6 @@ def enable_gpu():
     """Enable GPU usage on this node.
 
     """
-    if get_version('kubelet') < (1, 9):
-        hookenv.status_set(
-            'active',
-            'Upgrade to snap channel >= 1.9/stable to enable GPU support.'
-        )
-        return
-
     hookenv.log('Enabling gpu mode')
     try:
         # Not sure why this is necessary, but if you don't run this, k8s will
@@ -1237,7 +1232,6 @@ def catch_change_in_creds(kube_control):
             set_state('kubernetes-worker.restart-needed')
 
 
-@when_not('kube-control.connected')
 def missing_kube_control():
     """Inform the operator they need to add the kube-control relation.
 
@@ -1245,6 +1239,7 @@ def missing_kube_control():
     a charm in a deployment that pre-dates the kube-control relation, it'll be
     missing.
 
+    Called from charm_status.
     """
     try:
         goal_state = hookenv.goal_state()
@@ -1252,14 +1247,18 @@ def missing_kube_control():
         goal_state = {}
 
     if 'kube-control' in goal_state.get('relations', {}):
-        hookenv.status_set(
-            'waiting',
-            'Waiting for kubernetes-master to become ready')
+        if not is_flag_set("kube-control.connected"):
+            hookenv.status_set(
+                'waiting',
+                'Waiting for kubernetes-master to become ready')
+            return True
     else:
         hookenv.status_set(
             'blocked',
             'Relate {}:kube-control kubernetes-master:kube-control'.format(
                 hookenv.service_name()))
+        return True
+    return False
 
 
 def _systemctl_is_active(application):
